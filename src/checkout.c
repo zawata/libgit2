@@ -1883,6 +1883,116 @@ static int checkout_create_the_new(
 	return 0;
 }
 
+#if defined(GIT_THREADS) && defined(GIT_WIN32)
+
+struct thread_params {
+	git_thread thread;
+	checkout_data *cd;
+
+	git_cond *cond;
+	git_mutex *mutex;
+
+	git_atomic *active_threads;
+	git_atomic *delta_index;
+	git_atomic *error;
+	git_vector *finished_paths;
+};
+
+static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
+
+static int threaded_checkout_create_the_new(
+	unsigned int *actions,
+	checkout_data *data)
+{
+	struct thread_params *p;
+	size_t i;
+	int ret,
+		num_threads = git_online_cpus(),
+		num_deltas = git_vector_length(&data->diff->deltas);
+	git_atomic active_threads, delta_index, error;
+	git_vector finished_paths;
+	git_cond cond;
+	git_mutex mutex;
+	const char *finished_path;
+
+	if (num_threads <= 1) {
+		return checkout_create_the_new(actions, data);
+	}
+
+	if ((ret = git_vector_init(&finished_paths, num_deltas, paths_cmp)) < 0)
+		return ret;
+
+	p = git__mallocarray(num_threads, sizeof(*p));
+	GITERR_CHECK_ALLOC(p);
+
+	git_cond_init(&cond);
+	git_mutex_init(&mutex);
+	git_mutex_lock(&mutex);
+
+	git_atomic_set(&active_threads, 0);
+	git_atomic_set(&delta_index, 0);
+	git_atomic_set(&error, 0);
+
+	/* Initialize worker threads */
+	for (i = 0; i < num_threads; ++i) {
+		p[i].cd = data;
+		p[i].cond = &cond;
+		p[i].mutex = &mutex;
+		p[i].active_threads = &active_threads;
+		p[i].error = &error;
+		p[i].delta_index = &delta_index;
+		p[i].finished_paths = &finished_paths;
+	}
+
+	/* Start worker threads */
+	for (i = 0; i < num_threads; ++i) {
+		ret = git_thread_create(&p[i].thread, worker_checkout_create_the_new, &p[i]);
+
+		/* On error, we will cleanly exit any started worker threads,
+		 * and then return with our error code */
+		if (ret) {
+			git_atomic_set(&error, -1);
+			giterr_set(GITERR_THREAD, "unable to create thread");
+			git_mutex_unlock(&mutex);
+			/* Only clean up the number of threads we have started */
+			num_threads = i;
+			ret = -1;
+			goto cleanup;
+		}
+
+		git_atomic_inc(&active_threads);
+	}
+
+	while (git_atomic_get(&active_threads)) {
+		git_cond_wait(&cond, &mutex);
+
+		ret = git_atomic_get(&error);
+		if (ret != 0 || git_atomic_get(&active_threads) == 0)
+			goto cleanup;
+
+		if (git_vector_length(&finished_paths) > 0) {
+			git_vector_foreach(&finished_paths, i, finished_path) {
+				report_progress(data, finished_path);
+			}
+			git_vector_clear(&finished_paths);
+		}
+	}
+
+cleanup:
+	for (i = 0; i < num_threads; ++i) {
+		git_thread_join(p[i].thread, NULL);
+	}
+
+	git__free(p);
+	git_vector_free(&finished_paths);
+	git_cond_free(&cond);
+	git_mutex_free(&mutex);
+
+	return ret;
+}
+
+#endif
+
 static int checkout_create_submodules(
 	unsigned int *actions,
 	checkout_data *data)
