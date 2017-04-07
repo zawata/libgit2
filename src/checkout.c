@@ -72,7 +72,6 @@ typedef struct {
 	git_buf tmp;
 	unsigned int strategy;
 	int can_symlink;
-	bool reload_submodules;
 	size_t total_steps;
 	size_t completed_steps;
 	git_checkout_perfdata perfdata;
@@ -1766,10 +1765,6 @@ static int checkout_blob(
 	if (!error && (data->strategy & GIT_CHECKOUT_DONT_UPDATE_INDEX) == 0)
 		error = checkout_update_index(data, file, &st);
 
-	/* update the submodule data if this was a new .gitmodules file */
-	if (!error && strcmp(file->path, ".gitmodules") == 0)
-		data->reload_submodules = true;
-
 	return error;
 }
 
@@ -1852,6 +1847,33 @@ static int checkout_deferred_remove(git_repository *repo, const char *path)
 #endif
 }
 
+static int checkout_create_the_new_blob(
+	checkout_data *data,
+	unsigned int action,
+	git_diff_delta *delta)
+{
+	int error = 0;
+
+	if (action & CHECKOUT_ACTION__DEFER_REMOVE) {
+		/* this had a blocker directory that should only be removed iff
+		 * all of the contents of the directory were safely removed
+		 */
+		if ((error = checkout_deferred_remove(data->repo, delta->old_file.path)) < 0)
+			return error;
+	}
+
+	if (action & CHECKOUT_ACTION__UPDATE_BLOB) {
+		error = checkout_blob(data, &delta->new_file);
+		if (error < 0)
+			return error;
+
+		data->completed_steps++;
+		report_progress(data, delta->new_file.path);
+	}
+
+	return 0;
+}
+
 static int checkout_create_the_new(
 	unsigned int *actions,
 	checkout_data *data)
@@ -1861,23 +1883,8 @@ static int checkout_create_the_new(
 	size_t i;
 
 	git_vector_foreach(&data->diff->deltas, i, delta) {
-		if (actions[i] & CHECKOUT_ACTION__DEFER_REMOVE) {
-			/* this had a blocker directory that should only be removed iff
-			 * all of the contents of the directory were safely removed
-			 */
-			if ((error = checkout_deferred_remove(
-					data->repo, delta->old_file.path)) < 0)
-				return error;
-		}
-
-		if (actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
-			error = checkout_blob(data, &delta->new_file);
-			if (error < 0)
-				return error;
-
-			data->completed_steps++;
-			report_progress(data, delta->new_file.path);
-		}
+		if ((error = checkout_create_the_new_blob(data, actions[i], delta)) < 0)
+			return error;
 	}
 
 	return 0;
@@ -1887,6 +1894,11 @@ static int checkout_create_the_new(
 
 static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
 
+struct checkout_progress_pair {
+	int index;
+	int error;
+};
+
 struct thread_params {
 	git_thread thread;
 	const unsigned int *actions;
@@ -1895,24 +1907,22 @@ struct thread_params {
 	git_cond *cond;
 	git_mutex *mutex;
 
-	git_atomic *active_threads;
 	git_atomic *delta_index;
 	git_atomic *error;
-	git_vector *finished_paths;
+	git_vector *progress_pairs;
 };
 
 static void *threaded_checkout_create_the_new(void *arg)
 {
 	struct thread_params *worker = arg;
-	int error;
-	size_t i;
+	int error, i;
 
 	while ((i = git_atomic_inc(worker->delta_index)) <
 			git_vector_length(&worker->cd->diff->deltas)) {
 		git_diff_delta *delta = git_vector_get(&worker->cd->diff->deltas, i);
 
 		if (delta == NULL || git_atomic_get(worker->error) != 0)
-			goto cleanup;
+			return;
 
 		if (worker->actions[i] & CHECKOUT_ACTION__DEFER_REMOVE) {
 			/* this had a blocker directory that should only be removed iff
@@ -1921,28 +1931,29 @@ static void *threaded_checkout_create_the_new(void *arg)
 			if (
 				(error = checkout_deferred_remove(data->repo, delta->old_file.path)) < 0) {
 				git_atomic_set(worker->error, error);
-				goto cleanup;
+				git_cond_signal(worker->cond);
+				return;
 			}
 		}
 
+		/* We will retry failed operations in the calling thread to handle
+		* the case where might encounter a file locking error due to
+		* multithreading and name collisions.
+		*/
 		if (worker->actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
-			if ((error = checkout_blob(data, &delta->new_file)) < 0) {
-				git_atomic_set(worker->error, error);
-				goto cleanup;
-			}
+			checkout_progress_pair *progress_pair = (checkout_progress_pair*)malloc(
+				sizeof(checkout_progress_pair));
+			GITERR_CHECK_ALLOC(progress_pair);
+
+			progress_pair->index = i;
+			progress_pair->error = checkout_blob(data, &delta->new_file);
 
 			git_mutex_lock(worker->mutex);
-			git_vector_insert(worker->finished_paths, delta->new_file.path);
+			git_vector_insert(worker->progress_pairs, progress_pair);
 			git_cond_signal(worker->cond);
 			git_mutex_unlock(worker->mutex);
 		}
 	}
-
-cleanup:
-	git_mutex_lock(worker->mutex);
-	git_atomic_dec(worker->active_threads);
-	git_cond_signal(worker->cond);
-	git_mutex_unlock(worker->mutex);
 }
 
 static int ll_checkout_create_the_new(
@@ -1950,21 +1961,24 @@ static int ll_checkout_create_the_new(
 	checkout_data *data)
 {
 	struct thread_params *p;
-	size_t i;
+	size_t i, j;
 	int ret,
 		num_threads = git_online_cpus(),
-		num_deltas = git_vector_length(&data->diff->deltas);
+		num_deltas = git_vector_length(&data->diff->deltas),
+		last_index = 0;
+	checkout_progress_pair *progress_pair;
 	git_atomic active_threads, delta_index, error;
-	git_vector finished_paths;
+	git_vector errored_pairs, progress_pairs;
 	git_cond cond;
 	git_mutex mutex;
-	const char *finished_path;
 
 	if (num_threads <= 1) {
 		return checkout_create_the_new(actions, data);
 	}
 
-	if ((ret = git_vector_init(&finished_paths, num_deltas, paths_cmp)) < 0)
+	if (
+		(ret = git_vector_init(&progress_pairs, num_deltas, paths_cmp)) < 0 ||
+		(ret = git_vector_init(&failed_pairs, num_deltas, paths_cmp)) < 0)
 		return ret;
 
 	p = git__mallocarray(num_threads, sizeof(*p));
@@ -1987,7 +2001,7 @@ static int ll_checkout_create_the_new(
 		p[i].active_threads = &active_threads;
 		p[i].error = &error;
 		p[i].delta_index = &delta_index;
-		p[i].finished_paths = &finished_paths;
+		p[i].progress_pairs = &progress_pairs;
 	}
 
 	/* Start worker threads */
@@ -2009,20 +2023,39 @@ static int ll_checkout_create_the_new(
 		git_atomic_inc(&active_threads);
 	}
 
-	while (git_atomic_get(&active_threads)) {
+	while (git_vector_length(&progress_pairs) != num_deltas) {
+		int current_index;
 		git_cond_wait(&cond, &mutex);
 
-		ret = git_atomic_get(&error);
-		if (ret != 0 || git_atomic_get(&active_threads) == 0)
+		current_index = git_vector_length(&progress_pairs);
+
+		if ((ret = git_atomic_get(&error)) != 0)
 			goto cleanup;
 
-		if (git_vector_length(&finished_paths) > 0) {
-			git_vector_foreach(&finished_paths, i, finished_path) {
-				data->completed_steps++;
-				report_progress(data, finished_path);
+		git_mutex_unlock(&mutex);
+
+		for (; last_index < current_index; ++last_index) {
+			progress_pair = git_vector_get(&progress_pairs,
+				last_index);
+			delta = git_vector_get(&data->diff->deltas, last_index);
+
+			/* We will retry errored checkouts synchronously after all the workers
+			 * complete
+			 */
+			if (progress_pair->error < 0) {
+				git_vector_insert(&errored_pairs, progress_pair);
+				continue;
 			}
-			git_vector_clear(&finished_paths);
+
+			data->completed_steps++;
+			report_progress(data, delta->new_file.path);
 		}
+	}
+
+	git_vector_foreach(&errored_pairs, i, progress_pair) {
+		git_diff_delta *delta = git_vector_get(&data->diff->deltas, progress_pair->index);
+		if ((ret = checkout_create_the_new_blob(data, actions[i], delta)) < 0)
+			goto cleanup;
 	}
 
 cleanup:
@@ -2031,7 +2064,8 @@ cleanup:
 	}
 
 	git__free(p);
-	git_vector_free(&finished_paths);
+	git_vector_free(&errored_pairs);
+	git_vector_free_deep(&progress_pairs);
 	git_cond_free(&cond);
 	git_mutex_free(&mutex);
 
