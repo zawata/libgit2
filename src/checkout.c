@@ -1898,9 +1898,12 @@ static int checkout_create_the_new(
 
 #if defined(GIT_THREADS) && defined(GIT_WIN32)
 
+static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
+
 struct thread_params {
 	git_thread thread;
-	checkout_data *cd;
+	const unsigned int *actions;
+	const checkout_data *cd;
 
 	git_cond *cond;
 	git_mutex *mutex;
@@ -1911,9 +1914,51 @@ struct thread_params {
 	git_vector *finished_paths;
 };
 
-static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
+static void *threaded_checkout_create_the_new(void *arg)
+{
+	struct thread_params *worker = arg;
+	int error;
+	size_t i;
 
-static int threaded_checkout_create_the_new(
+	while ((i = git_atomic_inc(worker->delta_index)) <
+			git_vector_length(&worker->cd->diff->deltas)) {
+		git_diff_delta *delta = git_vector_get(&worker->cd->diff->deltas, i);
+
+		if (delta == NULL || git_atomic_get(worker->error) != 0)
+			goto cleanup;
+
+		if (worker->actions[i] & CHECKOUT_ACTION__DEFER_REMOVE) {
+			/* this had a blocker directory that should only be removed iff
+			 * all of the contents of the directory were safely removed
+			 */
+			if (
+				(error = checkout_deferred_remove(data->repo, delta->old_file.path)) < 0) {
+				git_atomic_set(worker->error, error);
+				goto cleanup;
+			}
+		}
+
+		if (worker->actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
+			if ((error = checkout_blob(data, &delta->new_file)) < 0) {
+				git_atomic_set(worker->error, error);
+				goto cleanup;
+			}
+
+			git_mutex_lock(worker->mutex);
+			git_vector_insert(worker->finished_paths, delta->new_file.path);
+			git_cond_signal(worker->cond);
+			git_mutex_unlock(worker->mutex);
+		}
+	}
+
+cleanup:
+	git_mutex_lock(worker->mutex);
+	git_atomic_dec(worker->active_threads);
+	git_cond_signal(worker->cond);
+	git_mutex_unlock(worker->mutex);
+}
+
+static int ll_checkout_create_the_new(
 	unsigned int *actions,
 	checkout_data *data)
 {
@@ -1943,11 +1988,12 @@ static int threaded_checkout_create_the_new(
 	git_mutex_lock(&mutex);
 
 	git_atomic_set(&active_threads, 0);
-	git_atomic_set(&delta_index, 0);
+	git_atomic_set(&delta_index, -1);
 	git_atomic_set(&error, 0);
 
 	/* Initialize worker threads */
 	for (i = 0; i < num_threads; ++i) {
+		p[i].actions = actions;
 		p[i].cd = data;
 		p[i].cond = &cond;
 		p[i].mutex = &mutex;
@@ -1959,7 +2005,7 @@ static int threaded_checkout_create_the_new(
 
 	/* Start worker threads */
 	for (i = 0; i < num_threads; ++i) {
-		ret = git_thread_create(&p[i].thread, worker_checkout_create_the_new, &p[i]);
+		ret = git_thread_create(&p[i].thread, threaded_checkout_create_the_new, &p[i]);
 
 		/* On error, we will cleanly exit any started worker threads,
 		 * and then return with our error code */
@@ -1985,6 +2031,7 @@ static int threaded_checkout_create_the_new(
 
 		if (git_vector_length(&finished_paths) > 0) {
 			git_vector_foreach(&finished_paths, i, finished_path) {
+				data->completed_steps++;
 				report_progress(data, finished_path);
 			}
 			git_vector_clear(&finished_paths);
@@ -2003,6 +2050,10 @@ cleanup:
 
 	return ret;
 }
+
+#else
+
+#define ll_checkout_create_the_new checkout_create_the_new
 
 #endif
 
@@ -2728,7 +2779,7 @@ int git_checkout_iterator(
 		goto cleanup;
 
 	if (counts[CHECKOUT_ACTION__UPDATE_BLOB] > 0 &&
-		(error = checkout_create_the_new(actions, &data)) < 0)
+		(error = ll_checkout_create_the_new(actions, &data)) < 0)
 		goto cleanup;
 
 	if (counts[CHECKOUT_ACTION__UPDATE_SUBMODULE] > 0 &&
