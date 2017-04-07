@@ -1907,12 +1907,12 @@ static int checkout_create_the_new(
 
 static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
 
-struct checkout_progress_pair {
+typedef struct {
 	int index;
 	int error;
-};
+} checkout_progress_pair;
 
-struct thread_params {
+typedef struct {
 	git_thread thread;
 	const unsigned int *actions;
 	const checkout_data *cd;
@@ -1923,11 +1923,11 @@ struct thread_params {
 	git_atomic *delta_index;
 	git_atomic *error;
 	git_vector *progress_pairs;
-};
+} thread_params;
 
 static void *threaded_checkout_create_the_new(void *arg)
 {
-	struct thread_params *worker = arg;
+	thread_params *worker = arg;
 	int error, i;
 
 	while ((i = git_atomic_inc(worker->delta_index)) <
@@ -1935,17 +1935,17 @@ static void *threaded_checkout_create_the_new(void *arg)
 		git_diff_delta *delta = git_vector_get(&worker->cd->diff->deltas, i);
 
 		if (delta == NULL || git_atomic_get(worker->error) != 0)
-			return;
+			return NULL;
 
 		if (worker->actions[i] & CHECKOUT_ACTION__DEFER_REMOVE) {
 			/* this had a blocker directory that should only be removed iff
 			 * all of the contents of the directory were safely removed
 			 */
 			if (
-				(error = checkout_deferred_remove(data->repo, delta->old_file.path)) < 0) {
+				(error = checkout_deferred_remove(worker->cd->repo, delta->old_file.path)) < 0) {
 				git_atomic_set(worker->error, error);
 				git_cond_signal(worker->cond);
-				return;
+				return NULL;
 			}
 		}
 
@@ -1954,12 +1954,12 @@ static void *threaded_checkout_create_the_new(void *arg)
 		* multithreading and name collisions.
 		*/
 		if (worker->actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
-			checkout_progress_pair *progress_pair = (checkout_progress_pair*)malloc(
+			checkout_progress_pair *progress_pair = (checkout_progress_pair *)malloc(
 				sizeof(checkout_progress_pair));
 			GITERR_CHECK_ALLOC(progress_pair);
 
 			progress_pair->index = i;
-			progress_pair->error = checkout_blob(data, &delta->new_file);
+			progress_pair->error = checkout_blob(worker->cd, &delta->new_file);
 
 			git_mutex_lock(worker->mutex);
 			git_vector_insert(worker->progress_pairs, progress_pair);
@@ -1967,20 +1967,23 @@ static void *threaded_checkout_create_the_new(void *arg)
 			git_mutex_unlock(worker->mutex);
 		}
 	}
+
+	return NULL;
 }
 
 static int ll_checkout_create_the_new(
 	unsigned int *actions,
 	checkout_data *data)
 {
-	struct thread_params *p;
-	size_t i, j;
+	thread_params *p;
+	size_t i;
 	int ret,
 		num_threads = git_online_cpus(),
 		num_deltas = git_vector_length(&data->diff->deltas),
 		last_index = 0;
 	checkout_progress_pair *progress_pair;
-	git_atomic active_threads, delta_index, error;
+	git_atomic delta_index, error;
+	git_diff_delta *delta;
 	git_vector errored_pairs, progress_pairs;
 	git_cond cond;
 	git_mutex mutex;
@@ -1991,7 +1994,7 @@ static int ll_checkout_create_the_new(
 
 	if (
 		(ret = git_vector_init(&progress_pairs, num_deltas, paths_cmp)) < 0 ||
-		(ret = git_vector_init(&failed_pairs, num_deltas, paths_cmp)) < 0)
+		(ret = git_vector_init(&errored_pairs, num_deltas, paths_cmp)) < 0)
 		return ret;
 
 	p = git__mallocarray(num_threads, sizeof(*p));
@@ -2001,7 +2004,6 @@ static int ll_checkout_create_the_new(
 	git_mutex_init(&mutex);
 	git_mutex_lock(&mutex);
 
-	git_atomic_set(&active_threads, 0);
 	git_atomic_set(&delta_index, -1);
 	git_atomic_set(&error, 0);
 
@@ -2011,7 +2013,6 @@ static int ll_checkout_create_the_new(
 		p[i].cd = data;
 		p[i].cond = &cond;
 		p[i].mutex = &mutex;
-		p[i].active_threads = &active_threads;
 		p[i].error = &error;
 		p[i].delta_index = &delta_index;
 		p[i].progress_pairs = &progress_pairs;
@@ -2032,8 +2033,6 @@ static int ll_checkout_create_the_new(
 			ret = -1;
 			goto cleanup;
 		}
-
-		git_atomic_inc(&active_threads);
 	}
 
 	while (git_vector_length(&progress_pairs) != num_deltas) {
@@ -2063,17 +2062,18 @@ static int ll_checkout_create_the_new(
 			data->completed_steps++;
 			report_progress(data, delta->new_file.path);
 		}
+		git_mutex_lock(&mutex);
 	}
 
 	git_vector_foreach(&errored_pairs, i, progress_pair) {
-		git_diff_delta *delta = git_vector_get(&data->diff->deltas, progress_pair->index);
+		delta = git_vector_get(&data->diff->deltas, progress_pair->index);
 		if ((ret = checkout_create_the_new_blob(data, actions[i], delta)) < 0)
 			goto cleanup;
 	}
 
 cleanup:
 	for (i = 0; i < num_threads; ++i) {
-		git_thread_join(p[i].thread, NULL);
+		git_thread_join(&p[i].thread, NULL);
 	}
 
 	git__free(p);
