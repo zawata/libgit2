@@ -1893,8 +1893,9 @@ static int checkout_create_the_new(
 static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
 
 typedef struct {
-	int index;
 	int error;
+	int index;
+	int skipped;
 } checkout_progress_pair;
 
 typedef struct {
@@ -1917,6 +1918,7 @@ static void *threaded_checkout_create_the_new(void *arg)
 
 	while ((i = git_atomic_inc(worker->delta_index)) <
 			git_vector_length(&worker->cd->diff->deltas)) {
+		checkout_progress_pair *progress_pair;
 		git_diff_delta *delta = git_vector_get(&worker->cd->diff->deltas, i);
 
 		if (delta == NULL || git_atomic_get(worker->error) != 0)
@@ -1934,23 +1936,28 @@ static void *threaded_checkout_create_the_new(void *arg)
 			}
 		}
 
+		progress_pair = (checkout_progress_pair *)malloc(
+			sizeof(checkout_progress_pair));
+		GITERR_CHECK_ALLOC(progress_pair);
+
 		/* We will retry failed operations in the calling thread to handle
 		* the case where might encounter a file locking error due to
 		* multithreading and name collisions.
 		*/
 		if (worker->actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
-			checkout_progress_pair *progress_pair = (checkout_progress_pair *)malloc(
-				sizeof(checkout_progress_pair));
-			GITERR_CHECK_ALLOC(progress_pair);
-
 			progress_pair->index = i;
 			progress_pair->error = checkout_blob(worker->cd, &delta->new_file);
-
-			git_mutex_lock(worker->mutex);
-			git_vector_insert(worker->progress_pairs, progress_pair);
-			git_cond_signal(worker->cond);
-			git_mutex_unlock(worker->mutex);
+			progress_pair->skipped = 0;
+		} else {
+			progress_pair->index = i;
+			progress_pair->error = 0;
+			progress_pair->skipped = 1;
 		}
+
+		git_mutex_lock(worker->mutex);
+		git_vector_insert(worker->progress_pairs, progress_pair);
+		git_cond_signal(worker->cond);
+		git_mutex_unlock(worker->mutex);
 	}
 
 	return NULL;
@@ -2020,7 +2027,7 @@ static int ll_checkout_create_the_new(
 		}
 	}
 
-	while (git_vector_length(&progress_pairs) != num_deltas) {
+	while (git_vector_length(&progress_pairs) < num_deltas) {
 		int current_index;
 		git_cond_wait(&cond, &mutex);
 
@@ -2035,6 +2042,10 @@ static int ll_checkout_create_the_new(
 			progress_pair = git_vector_get(&progress_pairs,
 				last_index);
 			delta = git_vector_get(&data->diff->deltas, last_index);
+
+			if (progress_pair->skipped != 0) {
+				continue;
+			}
 
 			/* We will retry errored checkouts synchronously after all the workers
 			 * complete
