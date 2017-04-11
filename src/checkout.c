@@ -52,6 +52,12 @@ enum {
 };
 
 typedef struct {
+	git_atomic mkdir_calls;
+	git_atomic stat_calls;
+	git_atomic chmod_calls;
+} atomic_checkout_perfdata;
+
+typedef struct {
 	git_repository *repo;
 	git_iterator *target;
 	git_diff *diff;
@@ -73,7 +79,7 @@ typedef struct {
 	int can_symlink;
 	size_t total_steps;
 	size_t completed_steps;
-	git_checkout_perfdata perfdata;
+	atomic_checkout_perfdata perfdata;
 	git_strmap *mkdir_map;
 	git_attr_session attr_session;
 } checkout_data;
@@ -1402,6 +1408,7 @@ static bool should_remove_existing(checkout_data *data)
 #define MKDIR_REMOVE_EXISTING \
 	MKDIR_NORMAL | GIT_MKDIR_REMOVE_FILES | GIT_MKDIR_REMOVE_SYMLINKS
 
+/* not thread safe */
 static int checkout_mkdir(
 	checkout_data *data,
 	const char *path,
@@ -1418,9 +1425,9 @@ static int checkout_mkdir(
 	error = git_futils_mkdir_relative(
 		path, base, mode, flags, &mkdir_opts);
 
-	data->perfdata.mkdir_calls += mkdir_opts.perfdata.mkdir_calls;
-	data->perfdata.stat_calls += mkdir_opts.perfdata.stat_calls;
-	data->perfdata.chmod_calls += mkdir_opts.perfdata.chmod_calls;
+	git_atomic_add(&data->perfdata.mkdir_calls, mkdir_opts.perfdata.mkdir_calls);
+	git_atomic_add(&data->perfdata.stat_calls, mkdir_opts.perfdata.stat_calls);
+	git_atomic_add(&data->perfdata.chmod_calls, mkdir_opts.perfdata.chmod_calls);
 
 	return error;
 }
@@ -1444,7 +1451,7 @@ static int mkpath2file(
 		goto cleanup;
 
 	if (remove_existing) {
-		data->perfdata.stat_calls++;
+		git_atomic_inc(&data->perfdata.stat_calls);
 
 		if (p_lstat(path, &st) == 0) {
 
@@ -1567,7 +1574,7 @@ static int blob_content_to_file(
 		goto cleanup;
 
 	if (st) {
-		data->perfdata.stat_calls++;
+		git_atomic_inc(&data->perfdata.stat_calls);
 
 		if ((error = p_stat(path, st)) < 0) {
 			giterr_set(GITERR_OS, "failed to stat '%s'", path);
@@ -1606,7 +1613,7 @@ static int blob_content_to_link(
 	}
 
 	if (!error) {
-		data->perfdata.stat_calls++;
+		git_atomic_inc(&data->perfdata.stat_calls);
 
 		if ((error = p_lstat(path, st)) < 0)
 			giterr_set(GITERR_CHECKOUT, "could not stat symlink %s", path);
@@ -1652,7 +1659,7 @@ static int checkout_submodule_update_index(
 	if ((error = checkout_target_fullpath(&fullpath, data, file->path)) < 0)
 		goto cleanup;
 
-	data->perfdata.stat_calls++;
+	git_atomic_inc(&data->perfdata.stat_calls);
 	if (p_stat(git_buf_cstr(&fullpath), &st) < 0) {
 		giterr_set(
 			GITERR_CHECKOUT, "could not stat submodule %s\n", file->path);
@@ -1724,7 +1731,7 @@ static int checkout_safe_for_update_only(
 {
 	struct stat st;
 
-	data->perfdata.stat_calls++;
+	git_atomic_inc(&data->perfdata.stat_calls);
 
 	if (p_lstat(path, &st) < 0) {
 		/* if doesn't exist, then no error and no update */
@@ -2755,6 +2762,10 @@ static int checkout_data_init(
 	git_buf_truncate(&data->repo_path, git_buf_len(&data->repo_path));
 	git_attr_session__init(&data->attr_session, data->repo);
 
+	git_atomic_set(&data->perfdata->mkdir_calls, 0);
+	git_atomic_set(&data->perfdata->stat_calls, 0);
+	git_atomic_set(&data->perfdata->chmod_calls, 0);
+
 cleanup:
 	if (error < 0)
 		checkout_data_clear(data);
@@ -2887,8 +2898,13 @@ int git_checkout_iterator(
 
 	assert(data.completed_steps == data.total_steps);
 
-	if (data.opts.perfdata_cb)
-		data.opts.perfdata_cb(&data.perfdata, data.opts.perfdata_payload);
+	if (data.opts.perfdata_cb) {
+		git_checkout_perfdata perfdata;
+		perdata.mkdir_calls = git_atomic_get(&data.perfdata.mkdir_calls);
+		perfdata.stat_calls = git_atomic_get(&data.perfdata.stat_calls);
+		perfdata.chmod_calls = git_atomic_get(&data.perfdata.chmod_calls);
+		data.opts.perfdata_cb(&perfdata, data.opts.perfdata_payload);
+	}
 
 cleanup:
 	if (!error && data.index != NULL &&
