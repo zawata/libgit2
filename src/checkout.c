@@ -308,10 +308,8 @@ static int checkout_target_fullpath(
 {
 	git_buf_cpy(out, &data->repo_path);
 
-	if (path && git_buf_puts(out, path) < 0) {
-		git_buf_free(out);
+	if (path && git_buf_puts(out, path) < 0)
 		return -1;
-	}
 
 	return 0;
 }
@@ -320,17 +318,16 @@ static bool wd_item_is_removable(
 	checkout_data *data, const git_index_entry *wd)
 {
 	git_buf fullpath;
+	bool removable = false;
 
 	if (wd->mode != GIT_FILEMODE_TREE)
 		return true;
 
-	if (checkout_target_fullpath(&fullpath, data, wd->path) < 0)
-		return false;
-
-	bool removable = !git_path_contains(&fullpath, DOT_GIT);
+	if (checkout_target_fullpath(&fullpath, data, wd->path) >= 0) {
+		removable = !git_path_contains(&fullpath, DOT_GIT);
+	}
 
 	git_buf_free(&fullpath);
-
 	return removable;
 }
 
@@ -458,14 +455,13 @@ static bool submodule_is_config_only(
 static bool checkout_is_empty_dir(checkout_data *data, const char *path)
 {
 	git_buf fullpath;
+	bool is_empty = false;
 
-	if (checkout_target_fullpath(&fullpath, data, path) < 0)
-		return false;
-
-	bool is_empty = git_path_is_empty_dir(git_buf_cstr(&fullpath));
+	if (checkout_target_fullpath(&fullpath, data, path) >= 0) {
+		is_empty = git_path_is_empty_dir(git_buf_cstr(&fullpath));
+	}
 
 	git_buf_free(&fullpath);
-
 	return is_empty;
 }
 
@@ -1779,7 +1775,7 @@ static int checkout_blob(
 	int error = 0;
 
 	if ((error = checkout_target_fullpath(&fullpath, data, file->path)) < 0)
-		return -1;
+		goto cleanup;
 
 	if ((data->strategy & GIT_CHECKOUT_UPDATE_ONLY) != 0) {
 		error = checkout_safe_for_update_only(
@@ -1819,8 +1815,8 @@ static int checkout_remove_the_old(
 	if (data->opts.checkout_strategy & GIT_CHECKOUT_SKIP_LOCKED_DIRECTORIES)
 		flg |= GIT_RMDIR_SKIP_NONEMPTY;
 
-	if (checkout_target_fullpath(&fullpath, data, NULL) < 0)
-		return -1;
+	if ((error = checkout_target_fullpath(&fullpath, data, NULL)) < 0)
+		goto cleanup;
 
 	git_vector_foreach(&data->diff->deltas, i, delta) {
 		if (actions[i] & CHECKOUT_ACTION__REMOVE) {
@@ -1937,7 +1933,7 @@ static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a
 typedef struct {
 	int error;
 	int index;
-	int skipped;
+	bool skipped;
 } checkout_progress_pair;
 
 typedef struct {
@@ -1989,11 +1985,11 @@ static void *threaded_checkout_create_the_new(void *arg)
 		if (worker->actions[i] & CHECKOUT_ACTION__UPDATE_BLOB) {
 			progress_pair->index = i;
 			progress_pair->error = checkout_blob(worker->cd, &delta->new_file);
-			progress_pair->skipped = 0;
+			progress_pair->skipped = false;
 		} else {
 			progress_pair->index = i;
 			progress_pair->error = 0;
-			progress_pair->skipped = 1;
+			progress_pair->skipped = true;
 		}
 
 		git_mutex_lock(worker->mutex);
@@ -2085,9 +2081,8 @@ static int ll_checkout_create_the_new(
 				last_index);
 			delta = git_vector_get(&data->diff->deltas, last_index);
 
-			if (progress_pair->skipped != 0) {
+			if (progress_pair->skipped)
 				continue;
-			}
 
 			/* We will retry errored checkouts synchronously after all the workers
 			 * complete
@@ -2231,8 +2226,8 @@ static int checkout_write_entry(
 
 	assert (side == conflict->ours || side == conflict->theirs);
 
-	if (checkout_target_fullpath(&fullpath, data, side->path) < 0)
-		return -1;
+	if ((error = checkout_target_fullpath(&fullpath, data, side->path)) < 0)
+		goto cleanup;
 
 	if ((conflict->name_collision || conflict->directoryfile) &&
 		(data->strategy & GIT_CHECKOUT_USE_OURS) == 0 &&
@@ -2747,9 +2742,9 @@ static int checkout_data_init(
 	git_buf_truncate(&data->repo_path, git_buf_len(&data->repo_path));
 	git_attr_session__init(&data->attr_session, data->repo);
 
-	git_atomic_set(&data->perfdata->mkdir_calls, 0);
-	git_atomic_set(&data->perfdata->stat_calls, 0);
-	git_atomic_set(&data->perfdata->chmod_calls, 0);
+	git_atomic_set(&data->perfdata.mkdir_calls, 0);
+	git_atomic_set(&data->perfdata.stat_calls, 0);
+	git_atomic_set(&data->perfdata.chmod_calls, 0);
 
 cleanup:
 	if (error < 0)
@@ -2885,7 +2880,7 @@ int git_checkout_iterator(
 
 	if (data.opts.perfdata_cb) {
 		git_checkout_perfdata perfdata;
-		perdata.mkdir_calls = git_atomic_get(&data.perfdata.mkdir_calls);
+		perfdata.mkdir_calls = git_atomic_get(&data.perfdata.mkdir_calls);
 		perfdata.stat_calls = git_atomic_get(&data.perfdata.stat_calls);
 		perfdata.chmod_calls = git_atomic_get(&data.perfdata.chmod_calls);
 		data.opts.perfdata_cb(&perfdata, data.opts.perfdata_payload);
