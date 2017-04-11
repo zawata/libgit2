@@ -211,7 +211,7 @@ int git_buf_put(git_buf *buf, const char *data, size_t len)
 		size_t new_size;
 
 		assert(data);
-		
+
 		GITERR_CHECK_ALLOC_ADD(&new_size, buf->size, len);
 		GITERR_CHECK_ALLOC_ADD(&new_size, new_size, 1);
 		ENSURE_SIZE(buf, new_size);
@@ -997,4 +997,10 @@ int git_buf_unquote(git_buf *buf)
 invalid:
 	giterr_set(GITERR_INVALID, "invalid quoted line");
 	return -1;
+}
+
+void git_buf_cpy(git_buf *out, git_buf *buf)
+{
+	git_buf_init(out, git_buf_len(buf));
+	git_buf_puts(out, git_buf_cstr(buf));
 }
