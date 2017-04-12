@@ -2078,13 +2078,17 @@ static int ll_checkout_create_the_new(
 		}
 	}
 
-	while (git_vector_length(&progress_pairs) < num_deltas) {
-		git_cond_wait(&cond, &mutex);
+	while (last_index < num_deltas) {
+		if ((ret = git_atomic_get(&error)) != 0) {
+			git_mutex_unlock(&mutex);
+			goto cleanup;
+		}
 
 		current_index = git_vector_length(&progress_pairs);
 
-		if ((ret = git_atomic_get(&error)) != 0)
-			goto cleanup;
+		if (last_index == current_index) {
+			git_cond_wait(&cond, &mutex);
+		}
 
 		git_mutex_unlock(&mutex);
 
