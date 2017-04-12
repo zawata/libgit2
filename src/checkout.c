@@ -1962,7 +1962,7 @@ typedef struct {
 typedef struct {
 	git_thread thread;
 	const unsigned int *actions;
-	const checkout_data *cd;
+	checkout_data *cd;
 
 	git_cond *cond;
 	git_mutex *mutex;
@@ -1975,7 +1975,8 @@ typedef struct {
 static void *threaded_checkout_create_the_new(void *arg)
 {
 	thread_params *worker = arg;
-	int error, i;
+	int error;
+	size_t i;
 
 	while ((i = git_atomic_inc(worker->delta_index)) <
 			git_vector_length(&worker->cd->diff->deltas)) {
@@ -1999,7 +2000,11 @@ static void *threaded_checkout_create_the_new(void *arg)
 
 		progress_pair = (checkout_progress_pair *)malloc(
 			sizeof(checkout_progress_pair));
-		GITERR_CHECK_ALLOC(progress_pair);
+		if (progress_pair == NULL) {
+			git_atomic_set(worker->error, error);
+			git_cond_signal(worker->cond);
+			return NULL;
+		}
 
 		/* We will retry failed operations in the calling thread to handle
 		* the case where might encounter a file locking error due to
@@ -2029,11 +2034,9 @@ static int ll_checkout_create_the_new(
 	checkout_data *data)
 {
 	thread_params *p;
-	size_t i;
-	int ret,
-		num_threads = git_online_cpus(),
-		num_deltas = git_vector_length(&data->diff->deltas),
-		last_index = 0;
+	size_t i, num_threads = git_online_cpus(), last_index = 0, current_index = 0,
+		num_deltas = git_vector_length(&data->diff->deltas);
+	int ret;
 	checkout_progress_pair *progress_pair;
 	git_atomic delta_index, error;
 	git_diff_delta *delta;
@@ -2089,7 +2092,6 @@ static int ll_checkout_create_the_new(
 	}
 
 	while (git_vector_length(&progress_pairs) < num_deltas) {
-		int current_index;
 		git_cond_wait(&cond, &mutex);
 
 		current_index = git_vector_length(&progress_pairs);
@@ -2123,7 +2125,7 @@ static int ll_checkout_create_the_new(
 
 	git_vector_foreach(&errored_pairs, i, progress_pair) {
 		delta = git_vector_get(&data->diff->deltas, progress_pair->index);
-		if ((ret = checkout_create_the_new_blob(data, actions[i], delta)) < 0)
+		if ((ret = checkout_create_the_new_blob(data, actions[progress_pair->index], delta)) < 0)
 			goto cleanup;
 	}
 
