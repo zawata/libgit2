@@ -2084,6 +2084,7 @@ static int ll_checkout_create_the_new(
 
 		if (last_index == current_index) {
 			git_cond_wait(&cond, &mutex);
+			current_index = git_vector_length(&progress_pairs);
 		}
 
 		git_mutex_unlock(&mutex);
