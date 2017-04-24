@@ -1932,7 +1932,7 @@ static int checkout_create_the_new(
 	return 0;
 }
 
-#if defined(GIT_THREADS) && defined(GIT_WIN32)
+#if defined(GIT_THREADS)
 
 static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a, (char*)b); }
 
