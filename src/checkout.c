@@ -70,7 +70,6 @@ typedef struct {
 	git_pool pool;
 	git_mutex index_mutex;
 	git_mutex mkpath_mutex;
-	git_mutex filter_list_mutex;
 	git_vector removes;
 	git_vector remove_conflicts;
 	git_vector update_conflicts;
@@ -1532,13 +1531,13 @@ static int blob_content_to_file(
 	filter_opts.temp_buf = &temp_buf;
 
 	if (!data->opts.disable_filters) {
-		git_mutex_lock(&data->filter_list_mutex);
+		git_mutex_lock(&data->index_mutex);
 
 		error = git_filter_list__load_ext(
 			&fl, data->repo, blob, hint_path,
 			GIT_FILTER_TO_WORKTREE, &filter_opts);
 
-		git_mutex_unlock(&data->filter_list_mutex);
+		git_mutex_unlock(&data->index_mutex);
 
 		if(error) {
 			p_close(fd);
@@ -2599,7 +2598,6 @@ static void checkout_data_clear(checkout_data *data)
 
 	git_mutex_free(&data->index_mutex);
 	git_mutex_free(&data->mkpath_mutex);
-	git_mutex_free(&data->filter_list_mutex);
 }
 
 static int checkout_data_init(
@@ -2625,7 +2623,6 @@ static int checkout_data_init(
 	data->target = target;
 	git_mutex_init(&data->index_mutex);
 	git_mutex_init(&data->mkpath_mutex);
-	git_mutex_init(&data->filter_list_mutex);
 
 	GITERR_CHECK_VERSION(
 		proposed, GIT_CHECKOUT_OPTIONS_VERSION, "git_checkout_options");
