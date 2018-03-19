@@ -1027,3 +1027,9 @@ invalid:
 	giterr_set(GITERR_INVALID, "invalid quoted line");
 	return -1;
 }
+
+void git_buf_cpy(git_buf *out, git_buf *buf)
+{
+	git_buf_init(out, git_buf_len(buf));
+	git_buf_puts(out, git_buf_cstr(buf));
+}
