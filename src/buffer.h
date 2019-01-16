@@ -218,4 +218,8 @@ int git_buf_splice(
 	const char *data,
 	size_t nb_to_insert);
 
+void git_buf_cpy(
+	git_buf *out,
+	git_buf *buf);
+
 #endif
