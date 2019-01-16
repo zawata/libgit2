@@ -355,7 +355,7 @@ static bool wd_item_is_removable(
 		removable = !git_path_contains(&fullpath, DOT_GIT);
 	}
 
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return removable;
 }
 
@@ -487,7 +487,7 @@ static bool checkout_is_empty_dir(checkout_data *data, const char *path)
 		is_empty = git_path_is_empty_dir(git_buf_cstr(&fullpath));
 	}
 
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return is_empty;
 }
 
@@ -1600,7 +1600,7 @@ static int blob_content_to_file(
 
 	error = 0;
 cleanup:
-	git_buf_dispose(&temp_buf);
+	git_buf_free(&temp_buf);
 	return error;
 }
 
@@ -1685,7 +1685,7 @@ static int checkout_submodule_update_index(
 	error = checkout_update_index(data, file, &st);
 
 cleanup:
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return error;
 }
 
@@ -1833,7 +1833,7 @@ static int checkout_blob(
 		data->reload_submodules = true;
 
 cleanup:
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return error;
 }
 
@@ -1896,7 +1896,7 @@ static int checkout_remove_the_old(
 	error = 0;
 
 cleanup:
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return error;
 }
 
@@ -2320,7 +2320,7 @@ static int checkout_write_entry(
 		hint_path, side->mode, &st);
 
 cleanup:
-	git_buf_dispose(&fullpath);
+	git_buf_free(&fullpath);
 	return error;
 }
 
@@ -2632,8 +2632,8 @@ static void checkout_data_clear(checkout_data *data)
 	git__free(data->pfx);
 	data->pfx = NULL;
 
-	git_buf_dispose(&data->tmp);
-	git_buf_dispose(&data->repo_path);
+	git_buf_free(&data->tmp);
+	git_buf_free(&data->repo_path);
 
 	git_index_free(data->index);
 	data->index = NULL;
