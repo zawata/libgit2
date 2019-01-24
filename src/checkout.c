@@ -2045,7 +2045,7 @@ static int checkout_create_the_new__parallel(
 		return ret;
 
 	p = git__mallocarray(num_threads, sizeof(*p));
-	GITERR_CHECK_ALLOC(p);
+	GIT_ERROR_CHECK_ALLOC(p);
 
 	git_cond_init(&cond);
 	git_mutex_init(&mutex);
@@ -2073,7 +2073,7 @@ static int checkout_create_the_new__parallel(
 		 * and then return with our error code */
 		if (ret) {
 			git_atomic_set(&error, -1);
-			giterr_set(GITERR_THREAD, "unable to create thread");
+			git_error_set(GIT_ERROR_THREAD, "unable to create thread");
 			git_mutex_unlock(&mutex);
 			/* Only clean up the number of threads we have started */
 			num_threads = i;
