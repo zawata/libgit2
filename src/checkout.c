@@ -1442,9 +1442,9 @@ static int checkout_mkdir(
 	error = git_futils_mkdir_relative(
 		path, base, mode, flags, &mkdir_opts);
 
-	git_atomic_add(&data->perfdata.mkdir_calls, mkdir_opts.perfdata.mkdir_calls);
-	git_atomic_add(&data->perfdata.stat_calls, mkdir_opts.perfdata.stat_calls);
-	git_atomic_add(&data->perfdata.chmod_calls, mkdir_opts.perfdata.chmod_calls);
+	git_atomic_add(&data->perfdata.mkdir_calls, (int)mkdir_opts.perfdata.mkdir_calls);
+	git_atomic_add(&data->perfdata.stat_calls, (int)mkdir_opts.perfdata.stat_calls);
+	git_atomic_add(&data->perfdata.chmod_calls, (int)mkdir_opts.perfdata.chmod_calls);
 
 	return error;
 }
@@ -1907,14 +1907,26 @@ cleanup:
 	return error;
 }
 
+enum {
+	NO_SYMLINKS = 0,
+	SYMLINKS_ONLY = 1
+};
+
 static int checkout_create_perform(
 	checkout_data *data,
 	unsigned int action,
-	git_diff_delta *delta)
+	git_diff_delta *delta,
+  unsigned int checkout_option)
 {
 	int error = 0;
 
 	if (action & CHECKOUT_ACTION__UPDATE_BLOB) {
+		if (checkout_option == NO_SYMLINKS && S_ISLNK(delta->new_file.mode))
+			return 0;
+
+		if (checkout_option == SYMLINKS_ONLY && !S_ISLNK(delta->new_file.mode))
+			return 0;
+
 		error = checkout_blob(data, &delta->new_file);
 		if (error < 0)
 			return error;
@@ -1935,7 +1947,12 @@ static int checkout_create_the_new__single(
 	size_t i;
 
 	git_vector_foreach(&data->diff->deltas, i, delta) {
-		if ((error = checkout_create_perform(data, actions[i], delta)) < 0)
+		if ((error = checkout_create_perform(data, actions[i], delta, NO_SYMLINKS)) < 0)
+			return error;
+	}
+
+	git_vector_foreach(&data->diff->deltas, i, delta) {
+		if ((error = checkout_create_perform(data, actions[i], delta, SYMLINKS_ONLY)) < 0)
 			return error;
 	}
 
@@ -1948,7 +1965,7 @@ static int paths_cmp(const void *a, const void *b) { return git__strcmp((char*)a
 
 typedef struct {
 	int error;
-	int index;
+	size_t index;
 	bool skipped;
 } checkout_progress_pair;
 
@@ -2028,17 +2045,6 @@ static int checkout_create_the_new__parallel(
 	git_cond cond;
 	git_mutex mutex;
 
-	/* Before we start creating, we need to create all the symlinks first
-	 * to ensure that we don't accidentally write data through symlinks into
-	 * the .git directory.
-	 */
-	git_vector_foreach(&data->diff->deltas, i, delta) {
-		if (S_ISLNK(delta->new_file.mode) &&
-				actions[i] & CHECKOUT_ACTION__UPDATE_BLOB &&
-				(ret = checkout_create_perform(data, actions[i], delta)) < 0)
-			return ret;
-	}
-
 	if (
 		(ret = git_vector_init(&progress_pairs, num_deltas, paths_cmp)) < 0 ||
 		(ret = git_vector_init(&errored_pairs, num_deltas, paths_cmp)) < 0)
@@ -2113,10 +2119,6 @@ static int checkout_create_the_new__parallel(
 				continue;
 			}
 
-	git_vector_foreach(&data->diff->deltas, i, delta) {
-		if (actions[i] & CHECKOUT_ACTION__UPDATE_BLOB && S_ISLNK(delta->new_file.mode)) {
-			if ((error = checkout_blob(data, &delta->new_file)) < 0)
-				return error;
 			data->completed_steps++;
 			report_progress(data, delta->new_file.path);
 		}
@@ -2125,7 +2127,19 @@ static int checkout_create_the_new__parallel(
 
 	git_vector_foreach(&errored_pairs, i, progress_pair) {
 		delta = git_vector_get(&data->diff->deltas, progress_pair->index);
-		if ((ret = checkout_create_perform(data, actions[progress_pair->index], delta)) < 0)
+		if ((ret = checkout_create_perform(data, actions[progress_pair->index], delta,
+			NO_SYMLINKS)) < 0)
+				goto cleanup;
+	}
+
+	/* After we create everything else, we need to create all the symlinks
+	 * to ensure that we don't accidentally write data through symlinks into
+	 * the .git directory.
+	 */
+	git_vector_foreach(&data->diff->deltas, i, delta) {
+		if (S_ISLNK(delta->new_file.mode) &&
+				actions[i] & CHECKOUT_ACTION__UPDATE_BLOB &&
+				(ret = checkout_create_perform(data, actions[i], delta, SYMLINKS_ONLY)) < 0)
 			goto cleanup;
 	}
 
@@ -2915,9 +2929,9 @@ int git_checkout_iterator(
 
 	if (data.opts.perfdata_cb) {
 		git_checkout_perfdata perfdata;
-		perfdata.mkdir_calls = git_atomic_get(&data.perfdata.mkdir_calls);
-		perfdata.stat_calls = git_atomic_get(&data.perfdata.stat_calls);
-		perfdata.chmod_calls = git_atomic_get(&data.perfdata.chmod_calls);
+		perfdata.mkdir_calls = (size_t)git_atomic_get(&data.perfdata.mkdir_calls);
+		perfdata.stat_calls = (size_t)git_atomic_get(&data.perfdata.stat_calls);
+		perfdata.chmod_calls = (size_t)git_atomic_get(&data.perfdata.chmod_calls);
 		data.opts.perfdata_cb(&perfdata, data.opts.perfdata_payload);
 	}
 
