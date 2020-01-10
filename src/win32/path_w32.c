@@ -85,9 +85,6 @@ int git_win32_path_canonicalize(git_win32_path path)
 {
 	wchar_t *base, *from, *to, *next;
 	size_t len;
-	size_t max_path_length = git_win32_longpaths_support
-		? GIT_WIN_PATH_UTF16
-		: GIT_WIN_SHORT_PATH_UTF16;
 
 	base = to = path__skip_prefix(path);
 
@@ -144,22 +141,20 @@ int git_win32_path_canonicalize(git_win32_path path)
 	while (to > base && to[-1] == L'\\') to--;
 
 	*to = L'\0';
-	len = to - path;
-	if (len >= 8 && wcsncmp(L"\\\\?\\UNC\\", path, 8) != 0) {
-		/* Not a UNC path, max length shorter by 2 */
-		max_path_length -= 2;
-	}
-	if (len >= max_path_length) {
+	if ((to - path) > INT_MAX) {
 		SetLastError(ERROR_FILENAME_EXCED_RANGE);
 		return -1;
 	}
 
-	return (int)len;
+	return (int)(to - path);
 }
 
 int git_win32_path__cwd(wchar_t *out, size_t len)
 {
 	int cwd_len;
+	int max_path_length = git_win32_longpaths_support
+		? WIN_GIT_PATH_MAX
+		: WIN_GIT_SHORT_PATH_MAX;
 
 	if (len > INT_MAX) {
 		errno = ENAMETOOLONG;
@@ -176,7 +171,7 @@ int git_win32_path__cwd(wchar_t *out, size_t len)
 		 * '\'s, but we we add a 'UNC' specifier to the path, plus
 		 * a trailing directory separator, plus a NUL.
 		 */
-		if (cwd_len > WIN_GIT_PATH_MAX - 4) {
+		if (cwd_len > max_path_length - 4) {
 			errno = ENAMETOOLONG;
 			return -1;
 		}
@@ -193,7 +188,7 @@ int git_win32_path__cwd(wchar_t *out, size_t len)
 	 * working directory.  (One character for the directory separator,
 	 * one for the null.
 	 */
-	else if (cwd_len > WIN_GIT_PATH_MAX - 2) {
+	else if (cwd_len > max_path_length - 2) {
 		errno = ENAMETOOLONG;
 		return -1;
 	}
@@ -204,6 +199,9 @@ int git_win32_path__cwd(wchar_t *out, size_t len)
 int git_win32_path_from_utf8(git_win32_path out, const char *src)
 {
 	wchar_t *dest = out;
+	size_t max_path_length = git_win32_longpaths_support
+		? WIN_GIT_PATH_MAX
+		: WIN_GIT_SHORT_PATH_MAX;
 
 	/* All win32 paths are in NT-prefixed format, beginning with "\\?\". */
 	memcpy(dest, PATH__NT_NAMESPACE, sizeof(wchar_t) * PATH__NT_NAMESPACE_LEN);
@@ -211,13 +209,13 @@ int git_win32_path_from_utf8(git_win32_path out, const char *src)
 
 	/* See if this is an absolute path (beginning with a drive letter) */
 	if (git_path_is_absolute(src)) {
-		if (git__utf8_to_16(dest, WIN_GIT_PATH_MAX, src) < 0)
+		if (git__utf8_to_16(dest, max_path_length, src) < 0)
 			goto on_error;
 	}
 	/* File-prefixed NT-style paths beginning with \\?\ */
 	else if (path__is_nt_namespace(src)) {
 		/* Skip the NT prefix, the destination already contains it */
-		if (git__utf8_to_16(dest, WIN_GIT_PATH_MAX, src + PATH__NT_NAMESPACE_LEN) < 0)
+		if (git__utf8_to_16(dest, max_path_length, src + PATH__NT_NAMESPACE_LEN) < 0)
 			goto on_error;
 	}
 	/* UNC paths */
@@ -226,12 +224,12 @@ int git_win32_path_from_utf8(git_win32_path out, const char *src)
 		dest += 4;
 
 		/* Skip the leading "\\" */
-		if (git__utf8_to_16(dest, WIN_GIT_PATH_MAX - 2, src + 2) < 0)
+		if (git__utf8_to_16(dest, max_path_length - 2, src + 2) < 0)
 			goto on_error;
 	}
 	/* Absolute paths omitting the drive letter */
 	else if (src[0] == '\\' || src[0] == '/') {
-		if (path__cwd(dest, WIN_GIT_PATH_MAX) < 0)
+		if (path__cwd(dest, (int)max_path_length) < 0)
 			goto on_error;
 
 		if (!git_path_is_absolute(dest)) {
@@ -240,19 +238,19 @@ int git_win32_path_from_utf8(git_win32_path out, const char *src)
 		}
 
 		/* Skip the drive letter specification ("C:") */
-		if (git__utf8_to_16(dest + 2, WIN_GIT_PATH_MAX - 2, src) < 0)
+		if (git__utf8_to_16(dest + 2, max_path_length - 2, src) < 0)
 			goto on_error;
 	}
 	/* Relative paths */
 	else {
 		int cwd_len;
 
-		if ((cwd_len = git_win32_path__cwd(dest, WIN_GIT_PATH_MAX)) < 0)
+		if ((cwd_len = git_win32_path__cwd(dest, max_path_length)) < 0)
 			goto on_error;
 
 		dest[cwd_len++] = L'\\';
 
-		if (git__utf8_to_16(dest + cwd_len, WIN_GIT_PATH_MAX - cwd_len, src) < 0)
+		if (git__utf8_to_16(dest + cwd_len, max_path_length - cwd_len, src) < 0)
 			goto on_error;
 	}
 
@@ -298,16 +296,19 @@ char *git_win32_path_8dot3_name(const char *path)
 	wchar_t *start;
 	char *shortname;
 	int len, namelen = 1;
+	int max_path_utf16_length = git_win32_longpaths_support
+		? GIT_WIN_PATH_UTF16
+		: GIT_WIN_SHORT_PATH_UTF16;
 
 	if (git_win32_path_from_utf8(longpath, path) < 0)
 		return NULL;
 
-	len = GetShortPathNameW(longpath, shortpath, GIT_WIN_PATH_UTF16);
+	len = GetShortPathNameW(longpath, shortpath, max_path_utf16_length);
 
 	while (len && shortpath[len-1] == L'\\')
 		shortpath[--len] = L'\0';
 
-	if (len == 0 || len >= GIT_WIN_PATH_UTF16)
+	if (len == 0 || len >= max_path_utf16_length)
 		return NULL;
 
 	for (start = shortpath + (len - 1);
@@ -343,6 +344,9 @@ int git_win32_path_readlink_w(git_win32_path dest, const git_win32_path path)
 	DWORD ioctl_ret;
 	wchar_t *target;
 	size_t target_len;
+	size_t max_path_utf16_length = git_win32_longpaths_support
+		? GIT_WIN_PATH_UTF16
+		: GIT_WIN_SHORT_PATH_UTF16;
 
 	int error = -1;
 
@@ -389,7 +393,7 @@ int git_win32_path_readlink_w(git_win32_path dest, const git_win32_path path)
 
 		/* Need one additional character in the target buffer
 		 * for the terminating NULL. */
-		if (GIT_WIN_PATH_UTF16 > target_len) {
+		if (max_path_utf16_length > target_len) {
 			wcscpy(dest, target);
 			error = (int)target_len;
 		}
