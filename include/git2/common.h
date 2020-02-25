@@ -205,7 +205,9 @@ typedef enum {
 	GIT_OPT_GET_PACK_MAX_OBJECTS,
 	GIT_OPT_SET_PACK_MAX_OBJECTS,
 	GIT_OPT_DISABLE_PACK_KEEP_FILE_CHECKS,
-	GIT_OPT_ENABLE_HTTP_EXPECT_CONTINUE
+	GIT_OPT_ENABLE_HTTP_EXPECT_CONTINUE,
+	GIT_OPT_SET_WINDOWS_LONGPATHS,
+	GIT_OPT_GET_WINDOWS_LONGPATHS
 } git_libgit2_opt_t;
 
 /**
@@ -403,6 +405,12 @@ typedef enum {
  *		> When connecting to a server using NTLM or Negotiate
  *		> authentication, use expect/continue when POSTing data.
  *		> This option is not available on Windows.
+ *
+ *	 opts(GIT_OPT_SET_WINDOWS_LONGPATHS, int enabled)
+ *		> Set whether longpaths (paths > 260) are allowed on Windows.
+ *
+ *	 opts(GIT_OPT_GET_WINDOWS_LONGPATHS, int *enabled)
+ *		> Get whether longpaths (paths > 260) are allowed on Windows.
  *
  * @param option Option key
  * @param ... value to set the option
