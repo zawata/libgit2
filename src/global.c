@@ -8,6 +8,7 @@
 #include "global.h"
 
 #include "alloc.h"
+#include "custom_tls.h"
 #include "hash.h"
 #include "sysdir.h"
 #include "filter.h"
@@ -30,6 +31,7 @@ typedef int (*git_global_init_fn)(void);
 
 static git_global_init_fn git__init_callbacks[] = {
 	git_allocator_global_init,
+	git_custom_tls__global_init,
 	git_hash_global_init,
 	git_sysdir_global_init,
 	git_filter_global_init,
