@@ -49,6 +49,12 @@ enum {
 };
 
 typedef struct {
+	git_str target_path;
+	size_t target_len;
+	git_str tmp;
+} checkout_buffers;
+
+typedef struct {
 	git_repository *repo;
 	git_iterator *target;
 	git_diff *diff;
@@ -62,9 +68,7 @@ typedef struct {
 	git_vector update_conflicts;
 	git_vector *update_reuc;
 	git_vector *update_names;
-	git_str target_path;
-	size_t target_len;
-	git_str tmp;
+	git_tlsdata_key buffers;
 	unsigned int strategy;
 	int can_symlink;
 	int respect_filemode;
@@ -324,15 +328,16 @@ static int checkout_action_no_wd(
 static int checkout_target_fullpath(
 	git_str **out, checkout_data *data, const char *path)
 {
-	git_str_truncate(&data->target_path, data->target_len);
+	checkout_buffers *buffers = git_tlsdata_get(data->buffers);
+	git_str_truncate(&buffers->target_path, buffers->target_len);
 
-	if (path && git_str_puts(&data->target_path, path) < 0)
+	if (path && git_str_puts(&buffers->target_path, path) < 0)
 		return -1;
 
-	if (git_path_validate_str_length(data->repo, &data->target_path) < 0)
+	if (git_path_validate_str_length(data->repo, &buffers->target_path) < 0)
 		return -1;
 
-	*out = &data->target_path;
+	*out = &buffers->target_path;
 
 	return 0;
 }
@@ -369,6 +374,7 @@ static int checkout_action_wd_only(
 	bool remove = false;
 	git_checkout_notify_t notify = GIT_CHECKOUT_NOTIFY_NONE;
 	const git_index_entry *wd = *wditem;
+	checkout_buffers *buffers = git_tlsdata_get(data->buffers);
 
 	if (!git_pathspec__match(
 			pathspec, wd->path,
@@ -424,8 +430,8 @@ static int checkout_action_wd_only(
 
 		/* copy the entry for issuing notification callback later */
 		git_index_entry saved_wd = *wd;
-		git_str_sets(&data->tmp, wd->path);
-		saved_wd.path = data->tmp.ptr;
+		git_str_sets(&buffers->tmp, wd->path);
+		saved_wd.path = buffers->tmp.ptr;
 
 		error = git_iterator_advance_over(
 			wditem, &untracked_state, workdir);
@@ -1520,6 +1526,7 @@ static int blob_content_to_file(
 	git_filter_list *fl = NULL;
 	int fd;
 	int error = 0;
+	checkout_buffers *buffers = git_tlsdata_get(data->buffers);
 
 	GIT_ASSERT(hint_path != NULL);
 
@@ -1537,7 +1544,7 @@ static int blob_content_to_file(
 	}
 
 	filter_session.attr_session = &data->attr_session;
-	filter_session.temp_buf = &data->tmp;
+	filter_session.temp_buf = &buffers->tmp;
 
 	if (!data->opts.disable_filters &&
 		(error = git_filter_list__load(
@@ -2089,6 +2096,7 @@ static int checkout_write_merge(
 	git_filter_list *fl = NULL;
 	git_filter_session filter_session = GIT_FILTER_SESSION_INIT;
 	int error = 0;
+	checkout_buffers *buffers = git_tlsdata_get(data->buffers);
 
 	if (data->opts.checkout_strategy & GIT_CHECKOUT_CONFLICT_STYLE_DIFF3)
 		opts.flags |= GIT_MERGE_FILE_STYLE_DIFF3;
@@ -2141,7 +2149,7 @@ static int checkout_write_merge(
 		in_data.size = result.len;
 
 		filter_session.attr_session = &data->attr_session;
-		filter_session.temp_buf = &data->tmp;
+		filter_session.temp_buf = &buffers->tmp;
 
 		if ((error = git_filter_list__load(
 				&fl, data->repo, NULL, result.path,
@@ -2332,6 +2340,16 @@ done:
 	return error;
 }
 
+static void GIT_SYSTEM_CALL dispose_checkout_buffers(void *_buffers) {
+	checkout_buffers *buffers = _buffers;
+	if (buffers == NULL)
+		return;
+
+	git_str_dispose(&buffers->target_path);
+	git_str_dispose(&buffers->tmp);
+	git__free(buffers);
+}
+
 static void checkout_data_clear(checkout_data *data)
 {
 	if (data->opts_free_baseline) {
@@ -2348,8 +2366,11 @@ static void checkout_data_clear(checkout_data *data)
 	git__free(data->pfx);
 	data->pfx = NULL;
 
-	git_str_dispose(&data->target_path);
-	git_str_dispose(&data->tmp);
+	if (data->buffers) {
+		dispose_checkout_buffers(git_tlsdata_get(data->buffers));
+		git_tlsdata_set(data->buffers, NULL);
+		git_tlsdata_dispose(data->buffers);
+	}
 
 	git_index_free(data->index);
 	data->index = NULL;
@@ -2381,6 +2402,7 @@ static int checkout_data_init(
 	git_iterator *target,
 	const git_checkout_options *proposed)
 {
+	checkout_buffers *buffers = NULL;
 	int error = 0;
 	git_repository *repo = git_iterator_owner(target);
 
@@ -2531,22 +2553,37 @@ static int checkout_data_init(
 		git_config_entry_free(conflict_style);
 	}
 
+	if ((error = git_tlsdata_init(&data->buffers, dispose_checkout_buffers)) < 0)
+		goto cleanup;
+
+	if ((buffers = git__malloc(sizeof(checkout_buffers))) == NULL) {
+		error = -1;
+		goto cleanup;
+	}
+
 	if ((error = git_pool_init(&data->pool, 1)) < 0 ||
 	    (error = git_vector_init(&data->removes, 0, git__strcmp_cb)) < 0 ||
 	    (error = git_vector_init(&data->remove_conflicts, 0, NULL)) < 0 ||
 	    (error = git_vector_init(&data->update_conflicts, 0, NULL)) < 0 ||
-	    (error = git_str_puts(&data->target_path, data->opts.target_directory)) < 0 ||
-	    (error = git_fs_path_to_dir(&data->target_path)) < 0 ||
+			(error = git_str_init(&buffers->target_path, 0)) < 0 ||
+			(error = git_str_init(&buffers->tmp, 0)) < 0 ||
+			(error = git_tlsdata_set(data->buffers, buffers)) < 0 ||
+			(error = git_str_puts(&buffers->target_path, data->opts.target_directory)) < 0 ||
+	    (error = git_fs_path_to_dir(&buffers->target_path)) < 0 ||
 	    (error = git_strmap_new(&data->mkdir_map)) < 0)
 		goto cleanup;
 
-	data->target_len = git_str_len(&data->target_path);
+	buffers->target_len = git_str_len(&buffers->target_path);
 
 	git_attr_session__init(&data->attr_session, data->repo);
 
 cleanup:
-	if (error < 0)
+	if (error < 0) {
+		if (data->buffers && buffers && git_tlsdata_get(data->buffers) == NULL)
+			dispose_checkout_buffers(buffers);
+
 		checkout_data_clear(data);
+	}
 
 	return error;
 }
