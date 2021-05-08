@@ -734,7 +734,7 @@ static int generate_request(
 		git_buf_printf(buf, "Expect: 100-continue\r\n");
 
 	if ((error = apply_server_credentials(buf, client, request)) < 0 ||
-	    (error = apply_proxy_credentials(buf, client, request)) < 0)
+	    (!client->proxy_connected && (error = apply_proxy_credentials(buf, client, request)) < 0))
 		return error;
 
 	if (request->custom_headers) {
@@ -1503,7 +1503,7 @@ int git_http_client_skip_body(git_http_client *client)
 			              "unexpected data handled in callback");
 			error = -1;
 		}
-	} while (!error);
+	} while (error >= 0 && client->state != DONE);
 
 	if (error < 0)
 		client->connected = 0;
