@@ -12,6 +12,7 @@
 #include "buf.h"
 #include "cache.h"
 #include "common.h"
+#include "custom_tls.h"
 #include "filter.h"
 #include "hash.h"
 #include "index.h"
@@ -72,6 +73,7 @@ int git_libgit2_init(void)
 		git_threadstate_global_init,
 		git_threads_global_init,
 		git_rand_global_init,
+		git_custom_tls__global_init,
 		git_hash_global_init,
 		git_sysdir_global_init,
 		git_filter_global_init,
